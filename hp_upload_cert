@@ -1,0 +1,97 @@
+#!/bin/bash
+#
+# Copyright (c) 2017  Josef Kufner <josef@kufner.cz>
+# 
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+# 
+#     http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+
+if [ -z "$1" ]
+then
+	echo Usage: $0 hostname
+	exit -1
+fi
+
+hostname="$1"
+dir="/etc/letsencrypt/live/$hostname"
+
+source_cert="$dir/fullchain.pem"
+source_key="$dir/privkey.pem"
+cert_file="$dir/cert+privkey.pfx"
+cert_installed="$dir/cert+privkey.installed.pem"
+cert_pass="foobar"
+
+
+fetch_cert() {
+	# Fetch the cert & store it locally
+	echo "openssl s_client -servername $hostname -connect $hostname:443"
+	if openssl s_client -servername "$hostname" -connect "$hostname":443 </dev/null >"$cert_installed.new"
+	then
+		mv "$cert_installed.new" "$cert_installed"
+	else
+		rm -f -- "$cert_installed.new"
+		echo "Failed to retrieve printer certificate." >&2
+		exit -1
+	fi
+}
+
+
+# Fetch installed certificate from the printer
+if ! [ -f "$cert_installed" ] || [ "$cert_installed" -ot "$cert_file" ]
+then
+	# Are you there?
+	if ! ping -q -c 1 $hostname >/dev/null
+	then
+		#echo "Host offline - no ping response." >&2
+		exit
+	fi
+
+	fetch_cert
+fi
+
+
+# Get fingerprints
+printer_fingerprint=$(openssl x509 -in "$cert_installed" -noout -fingerprint)
+file_fingerprint=$(openssl x509 -in "$source_cert" -noout -fingerprint)
+
+#echo "Printer: $printer_fingerprint"
+#echo "File:    $file_fingerprint"
+
+
+# Update cert if the printer has different certificate than we have here
+if [ "$printer_fingerprint" != "$file_fingerprint" ]
+then
+	# Convert certificate to something the printer likes
+	openssl pkcs12 -export -out "$cert_file" -inkey "$source_key" -in "$source_cert" -password "pass:$cert_pass"
+
+	echo
+	echo "Uploading certificate to $hostname ..."
+	echo
+	curl "https://$hostname/Security/DeviceCertificates/NewCertWithPassword/Upload?fixed_response=true" \
+		--insecure \
+		-X POST \
+		-H 'Pragma: no-cache' \
+		-H 'Cache-Control: no-cache' \
+		-H "Origin: https://$hostname" \
+		\
+		-F "certificate=@\"$cert_file\";type=application/x-pkcs12;filename=certificate.pfx" \
+		-F "password=$cert_pass" \
+		#--trace-ascii '-'
+	#
+
+	# Flush cached cert
+	rm -f -- "$cert_installed"
+	echo
+	sleep 10	# Let the printer process the change
+	fetch_cert
+fi
+
